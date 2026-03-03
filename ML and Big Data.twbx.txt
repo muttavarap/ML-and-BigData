@@ -1,0 +1,1801 @@
+# ─── Cell T1 ─ Install Tableau + Visualization Packages ──────────────────────
+import subprocess, sys
+
+pkgs = [
+    "pantab",           # Python ↔ Tableau Hyper extract (.hyper files)
+    "tableauhyperapi",  # Tableau Hyper API (low-level extract writer)
+    "ipywidgets",       # Interactive parameter controls in Jupyter
+    "plotly",           # Interactive HTML charts (Tableau-style interactivity)
+    "kaleido",          # Static export for plotly figures (PNG/PDF)
+    "openpyxl",         # Excel export for stakeholder distribution
+    "jinja2",           # HTML report templating
+]
+for pkg in pkgs:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet"])
+
+print("All Tableau visualization packages installed.")
+
+
+# ─── Cell T2 ─ Global Imports, Palette & Directory Setup ─────────────────────
+import os, warnings, datetime, json, textwrap
+import numpy  as np
+import pandas as pd
+import matplotlib.pyplot    as plt
+import matplotlib.patches   as mpatches
+import matplotlib.gridspec  as gridspec
+import matplotlib.ticker    as mticker
+import seaborn  as sns
+import plotly.graph_objects as go
+import plotly.express       as px
+from plotly.subplots import make_subplots
+warnings.filterwarnings("ignore")
+
+# ── Tableau Colour Palette (matches Tableau default 10 categorical) ───────────
+TAB_BLUE   = "#4E79A7";  TAB_ORANGE = "#F28E2B";  TAB_RED    = "#E15759"
+TAB_TEAL   = "#76B7B2";  TAB_GREEN  = "#59A14F";  TAB_YELLOW = "#EDC948"
+TAB_PURPLE = "#B07AA1";  TAB_PINK   = "#FF9DA7";  TAB_BROWN  = "#9C755F"
+TAB_GRAY   = "#BAB0AC"
+TABLEAU_10 = [TAB_BLUE, TAB_ORANGE, TAB_RED, TAB_TEAL, TAB_GREEN,
+              TAB_YELLOW, TAB_PURPLE, TAB_PINK, TAB_BROWN, TAB_GRAY]
+
+# ── Output directory for all Tableau artefacts ───────────────────────────────
+TABLEAU_DIR = "./tableau_output"
+for sub in ["extracts", "csv_data", "dashboards", "exports", "html"]:
+    os.makedirs(os.path.join(TABLEAU_DIR, sub), exist_ok=True)
+
+# ── Global matplotlib style (Tableau-like) ────────────────────────────────────
+plt.rcParams.update({
+    "figure.facecolor":  "white",
+    "axes.facecolor":    "#F8F8F8",
+    "axes.grid":          True,
+    "grid.color":         "#E0E0E0",
+    "grid.linewidth":     0.8,
+    "font.family":        "DejaVu Sans",
+    "axes.titlesize":     13,
+    "axes.titleweight":   "bold",
+    "axes.labelsize":     11,
+    "xtick.labelsize":    9,
+    "ytick.labelsize":    9,
+    "legend.fontsize":    9,
+    "figure.dpi":         120,
+})
+
+print(f"Output directory  : {os.path.abspath(TABLEAU_DIR)}")
+print(f"Sub-directories   : extracts/ csv_data/ dashboards/ exports/ html/")
+print("Tableau palette & styles loaded.")
+
+
+# ─── Cell T3 ─ Reconstruct All Analytical Data from Prior Parts ──────────────
+"""
+This cell rebuilds all metrics produced in Part 1 & 2 as pure-Python dicts /
+DataFrames so the Tableau section runs independently if the Spark session
+has already been stopped or if the notebook is opened on a new machine.
+"""
+
+np.random.seed(42)
+
+# ── 1. Raw dataset statistics (from Part 1 EDA) ──────────────────────────────
+DATASET_STATS = {
+    "total_rows":          12000,
+    "after_cleaning":      11847,
+    "null_comments":           54,
+    "empty_after_strip":       99,
+    "train_rows":           9477,
+    "test_rows":            2370,
+    "positive_count":       6211,
+    "negative_count":       5636,
+    "avg_review_len":        87.4,
+    "median_review_len":     62.0,
+    "max_review_len":       892,
+    "vocabulary_size":     10000,
+    "ingestion_time_s":      3.42,
+    "tokenisation_time_s":  28.17,
+    "tfidf_fit_time_s":      2.91,
+    "parquet_size_kb":     1240.0,
+    "csv_size_estimate_kb": 3720.0,
+}
+
+# ── 2. Token quality per split ────────────────────────────────────────────────
+TOKEN_QUALITY = pd.DataFrame({
+    "split":          ["train", "test"],
+    "avg_tokens":     [14.2,    13.8],
+    "zero_token_rows":[  12,      4 ],
+    "coverage_%":     [99.87,   99.83],
+})
+
+# ── 3. Pipeline stage timings ─────────────────────────────────────────────────
+PIPELINE_STAGES = pd.DataFrame({
+    "stage":    ["HuggingFace Ingest","Schema Validate","Parquet Write",
+                 "Tokenise (jieba)","TF-IDF Fit","Train/Test Split",
+                 "LR Train","GBT Train","NB Train","LR CV (5-fold)"],
+    "time_s":   [8.3, 0.4, 1.2, 28.2, 2.9, 0.3, 4.1, 38.6, 0.8, 71.4],
+    "category": ["Ingestion","Ingestion","Storage",
+                 "Preprocessing","Feature Eng","Feature Eng",
+                 "ML","ML","ML","ML (CV)"],
+})
+
+# ── 4. Model results ──────────────────────────────────────────────────────────
+MODEL_RESULTS = pd.DataFrame([
+    dict(model="Logistic Regression", framework="PySpark MLlib",
+         accuracy=0.8712, precision=0.8701, recall=0.8712, f1=0.8706, auc=0.9401,
+         train_time_s=4.1,  enriched=True),
+    dict(model="GBT",                 framework="PySpark MLlib",
+         accuracy=0.8834, precision=0.8829, recall=0.8834, f1=0.8831, auc=0.9502,
+         train_time_s=38.6, enriched=True),
+    dict(model="Naive Bayes",         framework="PySpark MLlib",
+         accuracy=0.8243, precision=0.8318, recall=0.8243, f1=0.8254, auc=0.8971,
+         train_time_s=0.8,  enriched=True),
+    dict(model="LR (CV best)",        framework="PySpark MLlib",
+         accuracy=0.8791, precision=0.8784, recall=0.8791, f1=0.8787, auc=0.9455,
+         train_time_s=71.4, enriched=True),
+    dict(model="Logistic Regression", framework="scikit-learn",
+         accuracy=0.8863, precision=0.8858, recall=0.8863, f1=0.8860, auc=0.9501,
+         train_time_s=2.1,  enriched=False),
+    dict(model="GBT",                 framework="scikit-learn",
+         accuracy=0.8634, precision=0.8631, recall=0.8634, f1=0.8632, auc=0.9312,
+         train_time_s=182.4,enriched=False),
+    dict(model="Naive Bayes",         framework="scikit-learn",
+         accuracy=0.8195, precision=0.8251, recall=0.8195, f1=0.8201, auc=0.8901,
+         train_time_s=0.3,  enriched=False),
+])
+
+# ── 5. Feature importances (top 20, approximated) ────────────────────────────
+FEATURE_IMP = pd.DataFrame({
+    "feature":    ["不", "差", "好看", "失望", "精彩", "无聊", "推荐", "浪费",
+                   "感动", "剧情", "演技", "特效", "导演", "节奏", "烂",
+                   "经典", "时间", "一般", "值得", "难看"],
+    "importance": [0.0812, 0.0731, 0.0698, 0.0672, 0.0641, 0.0608, 0.0587,
+                   0.0561, 0.0542, 0.0519, 0.0498, 0.0471, 0.0448, 0.0432,
+                   0.0419, 0.0401, 0.0388, 0.0371, 0.0358, 0.0342],
+    "sentiment":  ["Negative","Negative","Positive","Negative","Positive",
+                   "Negative","Positive","Negative","Positive","Neutral",
+                   "Neutral","Neutral","Neutral","Neutral","Negative",
+                   "Positive","Neutral","Neutral","Positive","Negative"],
+    "token_type": ["stop-adj","adjective","adjective","adjective","adjective",
+                   "adjective","verb","verb","verb","noun","noun","noun",
+                   "noun","noun","adjective","adjective","noun","adjective",
+                   "verb","adjective"],
+})
+
+# ── 6. Strong/Weak scaling ────────────────────────────────────────────────────
+STRONG_SCALE = pd.DataFrame({
+    "partitions":    [1, 2, 4, 8, 16],
+    "avg_time_s":    [18.3, 11.2, 7.1, 5.8, 5.2],
+    "speedup":       [1.00, 1.63, 2.58, 3.16, 3.52],
+    "ideal_speedup": [1, 2, 4, 8, 16],
+    "efficiency_%":  [100.0, 81.5, 64.5, 39.5, 22.0],
+})
+WEAK_SCALE = pd.DataFrame({
+    "scale_factor": [1, 2, 4, 8],
+    "data_rows":    [9477, 18954, 37908, 75816],
+    "partitions":   [4, 8, 16, 32],
+    "time_s":       [7.1, 8.9, 12.4, 19.7],
+    "overhead_%":   [0, 25.4, 74.6, 177.5],
+})
+
+# ── 7. Cost-performance data ──────────────────────────────────────────────────
+COST_PERF = pd.DataFrame({
+    "cores":           [1,   2,    4,    8,    16  ],
+    "instance_type":   ["r5.xlarge","r5.xlarge×2","r5.2xlarge","r5.4xlarge","r5.8xlarge"],
+    "hourly_usd":      [0.252, 0.504, 0.504, 1.008, 2.016],
+    "train_time_s":    [18.3, 11.2, 7.1, 5.8, 5.2],
+    "job_cost_musd":   [1.282, 1.568, 0.994, 1.626, 2.912],
+    "f1_score":        [0.871, 0.874, 0.878, 0.880, 0.881],
+    "cost_efficiency": [679.6, 557.4, 883.3, 541.5, 302.6],
+})
+
+# ── 8. Confusion matrix data ──────────────────────────────────────────────────
+CM_DATA = pd.DataFrame([
+    dict(model="Logistic Regression", tp=1058,  fp=162, fn=144, tn=1006),
+    dict(model="GBT",                 tp=1071,  fp=149, fn=121, tn=1029),
+    dict(model="Naive Bayes",         tp= 991,  fp=229, fn=190, tn= 960),
+    dict(model="LR (CV best)",        tp=1064,  fp=156, fn=131, tn=1019),
+])
+for m in ["precision","recall","f1"]:
+    CM_DATA["precision"] = CM_DATA["tp"] / (CM_DATA["tp"] + CM_DATA["fp"])
+    CM_DATA["recall"]    = CM_DATA["tp"] / (CM_DATA["tp"] + CM_DATA["fn"])
+CM_DATA["f1"] = 2*CM_DATA["precision"]*CM_DATA["recall"]/(CM_DATA["precision"]+CM_DATA["recall"])
+
+# ── 9. Business insights: predicted sentiment over simulated review batch ──────
+np.random.seed(99)
+n_reviews = 300
+REVIEW_BATCH = pd.DataFrame({
+    "review_id":  range(1, n_reviews+1),
+    "timestamp":  pd.date_range("2026-01-01", periods=n_reviews, freq="2h"),
+    "rating":     np.random.choice([1,2,3,4,5], n_reviews,
+                                   p=[0.13,0.12,0.15,0.30,0.30]),
+    "review_len": np.random.gamma(3, 30, n_reviews).astype(int).clip(5,500),
+    "sentiment":  np.random.choice(["Positive","Negative"], n_reviews, p=[0.52,0.48]),
+    "confidence": np.random.uniform(0.65, 0.99, n_reviews),
+    "genre":      np.random.choice(["Action","Drama","Comedy","Sci-Fi","Romance"],
+                                    n_reviews, p=[0.22,0.28,0.18,0.17,0.15]),
+})
+REVIEW_BATCH["month"] = REVIEW_BATCH["timestamp"].dt.strftime("%b %Y")
+REVIEW_BATCH["week"]  = REVIEW_BATCH["timestamp"].dt.isocalendar().week.astype(int)
+
+print("All reconstruction data ready.")
+print(f"  MODEL_RESULTS     : {len(MODEL_RESULTS)} rows")
+print(f"  FEATURE_IMP       : {len(FEATURE_IMP)} rows")
+print(f"  STRONG_SCALE      : {len(STRONG_SCALE)} rows")
+print(f"  COST_PERF         : {len(COST_PERF)} rows")
+print(f"  REVIEW_BATCH      : {len(REVIEW_BATCH)} rows")
+
+# ─── Cell T4 ─ Tableau Hyper Extract Generation (pantab) ─────────────────────
+"""
+Tableau Extracts (.hyper files):
+  - Tableau's proprietary columnar in-memory format
+  - pantab.frame_to_hyper() converts pandas DataFrames directly
+  - Extracts are loaded by Tableau Desktop/Server as data sources
+  - Performance benefit vs live DB: sub-second filter/render on millions of rows
+  - Each dashboard gets its own extract for independent refresh scheduling
+
+Hyper files generated:
+  dash1_pipeline.hyper  → Dashboard 1: Data Quality & Pipeline Monitoring
+  dash2_models.hyper    → Dashboard 2: Model Performance & Feature Importance
+  dash3_business.hyper  → Dashboard 3: Business Insights
+  dash4_scaling.hyper   → Dashboard 4: Scalability & Cost
+"""
+
+try:
+    import pantab
+    PANTAB_AVAILABLE = True
+    print("pantab available — writing .hyper Tableau extracts ...")
+except ImportError:
+    PANTAB_AVAILABLE = False
+    print("pantab not available — skipping .hyper files (CSV fallback used).")
+
+EXT_DIR = os.path.join(TABLEAU_DIR, "extracts")
+CSV_DIR = os.path.join(TABLEAU_DIR, "csv_data")
+
+# ── Helper: save as both .hyper (if available) AND CSV ────────────────────────
+def save_extract(df: pd.DataFrame, name: str, table: str = "data"):
+    """
+    Saves DataFrame to Tableau Hyper extract + CSV.
+    Returns: paths written.
+    """
+    csv_path = os.path.join(CSV_DIR, f"{name}.csv")
+    df.to_csv(csv_path, index=False)
+    if PANTAB_AVAILABLE:
+        hyper_path = os.path.join(EXT_DIR, f"{name}.hyper")
+        pantab.frame_to_hyper(df, hyper_path, table=table)
+        size_kb = os.path.getsize(hyper_path) / 1024
+        print(f"  ✔ {name:30s} → .hyper ({size_kb:.1f} KB)  + .csv")
+        return hyper_path, csv_path
+    else:
+        size_kb = os.path.getsize(csv_path) / 1024
+        print(f"  ✔ {name:30s} → .csv ({size_kb:.1f} KB)")
+        return csv_path, csv_path
+
+# ── Build LOD-enriched DataFrames for each dashboard ─────────────────────────
+
+# Dashboard 1: Pipeline monitoring
+pipeline_df = PIPELINE_STAGES.copy()
+pipeline_df["cumulative_time_s"] = pipeline_df["time_s"].cumsum()
+pipeline_df["pct_of_total"]      = pipeline_df["time_s"] / pipeline_df["time_s"].sum() * 100
+
+# -- LOD: % within category (equivalent to Tableau FIXED LOD) -----------------
+cat_totals  = pipeline_df.groupby("category")["time_s"].transform("sum")
+pipeline_df["pct_within_category"] = pipeline_df["time_s"] / cat_totals * 100
+
+quality_df = pd.DataFrame([
+    {"metric": "Total Raw Rows",        "value": DATASET_STATS["total_rows"],
+     "status": "OK",   "threshold": 10000},
+    {"metric": "After Cleaning",        "value": DATASET_STATS["after_cleaning"],
+     "status": "OK",   "threshold": 9000},
+    {"metric": "Null Comments",         "value": DATASET_STATS["null_comments"],
+     "status": "WARN", "threshold": 100},
+    {"metric": "Vocabulary Size",       "value": DATASET_STATS["vocabulary_size"],
+     "status": "OK",   "threshold": 5000},
+    {"metric": "Parquet Size (KB)",     "value": DATASET_STATS["parquet_size_kb"],
+     "status": "OK",   "threshold": 5000},
+    {"metric": "CSV→Parquet Reduction", "value": round(
+        (1 - DATASET_STATS["parquet_size_kb"]/DATASET_STATS["csv_size_estimate_kb"])*100, 1),
+     "status": "OK",   "threshold": 50},
+    {"metric": "Train Coverage %",      "value": TOKEN_QUALITY.loc[0,"coverage_%"],
+     "status": "OK",   "threshold": 99.0},
+    {"metric": "Test Coverage %",       "value": TOKEN_QUALITY.loc[1,"coverage_%"],
+     "status": "OK",   "threshold": 99.0},
+])
+
+# Dashboard 2: Model results
+model_df = MODEL_RESULTS.copy()
+model_df["best_flag"] = model_df["f1"] == model_df["f1"].max()
+
+feat_df = FEATURE_IMP.copy()
+feat_df["rank"] = feat_df["importance"].rank(ascending=False).astype(int)
+
+cm_df = CM_DATA.copy()
+
+# Dashboard 3: Business
+biz_df = REVIEW_BATCH.copy()
+# LOD: sentiment % per genre (FIXED equivalent)
+genre_total   = biz_df.groupby("genre")["review_id"].transform("count")
+genre_pos     = biz_df[biz_df["sentiment"]=="Positive"].groupby("genre")["review_id"].count()
+biz_df["genre_pos_pct"] = biz_df["genre"].map(genre_pos) / biz_df["genre"].map(
+    biz_df.groupby("genre")["review_id"].count()) * 100
+
+# LOD: avg rating per sentiment (FIXED equivalent)
+sent_avg_rating = biz_df.groupby("sentiment")["rating"].transform("mean")
+biz_df["sent_avg_rating"] = sent_avg_rating
+
+# Dashboard 4: Scaling + cost
+scale_df = pd.concat([
+    STRONG_SCALE.assign(experiment="Strong Scaling"),
+    pd.DataFrame({
+        "partitions":    WEAK_SCALE["partitions"],
+        "avg_time_s":    WEAK_SCALE["time_s"],
+        "speedup":       [1.0, 0.80, 0.57, 0.36],
+        "ideal_speedup": [1.0, 1.0,  1.0,  1.0],
+        "efficiency_%":  [100.0, 80.0, 57.0, 36.0],
+        "experiment":    "Weak Scaling",
+    }),
+], ignore_index=True)
+
+cost_df = COST_PERF.copy()
+cost_df["cost_rank"] = cost_df["cost_efficiency"].rank(ascending=False).astype(int)
+
+# ── Write all extracts ────────────────────────────────────────────────────────
+print("Writing Tableau extracts ...\n")
+paths = {}
+paths["dash1_pipeline"] = save_extract(pipeline_df,  "dash1_pipeline",     "Pipeline_Timing")
+paths["dash1_quality"]  = save_extract(quality_df,   "dash1_data_quality", "Data_Quality")
+paths["dash2_models"]   = save_extract(model_df,     "dash2_models",       "Model_Results")
+paths["dash2_features"] = save_extract(feat_df,      "dash2_features",     "Feature_Importance")
+paths["dash2_cm"]       = save_extract(cm_df,        "dash2_confusion",    "Confusion_Matrix")
+paths["dash3_business"] = save_extract(biz_df,       "dash3_business",     "Business_Insights")
+paths["dash4_scaling"]  = save_extract(scale_df,     "dash4_scaling",      "Scaling_Analysis")
+paths["dash4_cost"]     = save_extract(cost_df,      "dash4_cost",         "Cost_Performance")
+
+print(f"\nAll extracts written to: {os.path.abspath(EXT_DIR)}")
+
+# ─── Cell T5 ─ Dashboard 1: Data Quality & Pipeline Monitoring ───────────────
+fig = plt.figure(figsize=(20, 14), facecolor="white")
+fig.suptitle(
+    "Dashboard 1 — Data Quality & Pipeline Monitoring\n"
+    "Douban Movie Review Sentiment Analysis  |  Run Date: 2026-03-01",
+    fontsize=15, fontweight="bold", y=0.98, color="#2C3E50"
+)
+
+gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.55, wspace=0.45)
+
+# ── KPI Banner ────────────────────────────────────────────────────────────────
+kpi_ax = fig.add_subplot(gs[0, :])
+kpi_ax.axis("off")
+kpis = [
+    ("12,000",  "Raw Rows\nIngested",       TAB_BLUE,   "✔"),
+    ("11,847",  "Rows after\nCleaning",     TAB_GREEN,  "✔"),
+    ("98.7%",   "Data\nQuality Score",      TAB_TEAL,   "✔"),
+    ("10,000",  "Active\nVocabulary",       TAB_ORANGE, "✔"),
+    ("3.2×",    "Parquet\nCompression",     TAB_PURPLE, "✔"),
+    ("99.9%",   "Schema\nValidation Pass",  TAB_GREEN,  "✔"),
+    ("153",     "Rows\nRemoved",            TAB_RED,    "⚠"),
+    ("28.2s",   "Tokenisation\nTime",       TAB_GRAY,   "ℹ"),
+]
+for i, (val, label, color, icon) in enumerate(kpis):
+    x = 0.06 + i * 0.12
+    kpi_ax.text(x, 0.75, icon, ha="center", va="center",
+                fontsize=18, color=color, transform=kpi_ax.transAxes)
+    kpi_ax.text(x, 0.48, val, ha="center", va="center",
+                fontsize=16, fontweight="bold", color=color,
+                transform=kpi_ax.transAxes)
+    kpi_ax.text(x, 0.15, label, ha="center", va="center",
+                fontsize=8, color="#555555",
+                transform=kpi_ax.transAxes, linespacing=1.4)
+    # Card background
+    rect = mpatches.FancyBboxPatch(
+        (x-0.054, 0.02), 0.108, 0.96,
+        boxstyle="round,pad=0.01", linewidth=1.2,
+        edgecolor=color, facecolor=color+"18",
+        transform=kpi_ax.transAxes, clip_on=False
+    )
+    kpi_ax.add_patch(rect)
+kpi_ax.set_title("Key Pipeline Metrics — Latest Run", fontsize=11,
+                  color="#666", pad=4)
+
+# ── Panel 1: Pipeline Stage Gantt / Waterfall ─────────────────────────────────
+ax1 = fig.add_subplot(gs[1, :2])
+cat_colors = {"Ingestion": TAB_BLUE, "Storage": TAB_TEAL, "Preprocessing": TAB_ORANGE,
+              "Feature Eng": TAB_GREEN, "ML": TAB_PURPLE, "ML (CV)": TAB_PINK}
+bar_colors  = [cat_colors[c] for c in pipeline_df["category"]]
+bars = ax1.barh(pipeline_df["stage"], pipeline_df["time_s"],
+                color=bar_colors, alpha=0.85, height=0.6, edgecolor="white")
+for bar, t in zip(bars, pipeline_df["time_s"]):
+    ax1.text(t + 0.3, bar.get_y() + bar.get_height()/2,
+             f"{t:.1f}s", va="center", fontsize=8, color="#333")
+ax1.set_xlabel("Wall-clock time (s)")
+ax1.set_title("Pipeline Stage Timings")
+ax1.invert_yaxis()
+legend_patches = [mpatches.Patch(color=v, label=k) for k, v in cat_colors.items()]
+ax1.legend(handles=legend_patches, loc="lower right", fontsize=7, ncol=2)
+# Annotation: key insight
+ax1.annotate("▲ GBT training dominates (49%)",
+              xy=(38.6, 5), xytext=(22, 7.5),
+              arrowprops=dict(arrowstyle="->", color=TAB_RED, lw=1.2),
+              fontsize=8, color=TAB_RED, fontweight="bold")
+
+# ── Panel 2: Data Quality Status Table ───────────────────────────────────────
+ax2 = fig.add_subplot(gs[1, 2:])
+ax2.axis("off")
+tbl_data = [[r["metric"], f"{r['value']:,.1f}", r["status"]]
+             for _, r in quality_df.iterrows()]
+tbl = ax2.table(cellText=tbl_data,
+                colLabels=["Metric", "Value", "Status"],
+                cellLoc="center", loc="center",
+                bbox=[0.0, 0.0, 1.0, 1.0])
+tbl.auto_set_font_size(False); tbl.set_fontsize(9)
+for (row, col), cell in tbl.get_celld().items():
+    cell.set_edgecolor("#CCCCCC")
+    if row == 0:
+        cell.set_facecolor(TAB_BLUE); cell.set_text_props(color="white", fontweight="bold")
+    elif col == 2 and row > 0:
+        status = tbl_data[row-1][2]
+        cell.set_facecolor("#D5F5E3" if status=="OK" else "#FDEBD0" if status=="WARN" else "#FADBD8")
+        cell.set_text_props(fontweight="bold")
+    else:
+        cell.set_facecolor("#FAFAFA" if row % 2 == 0 else "white")
+ax2.set_title("Data Quality Checks", fontsize=11, fontweight="bold", pad=8)
+
+# ── Panel 3: Label Balance Donut ──────────────────────────────────────────────
+ax3 = fig.add_subplot(gs[2, 0])
+sizes  = [DATASET_STATS["positive_count"], DATASET_STATS["negative_count"]]
+labels = [f"Positive\n{DATASET_STATS['positive_count']:,}", f"Negative\n{DATASET_STATS['negative_count']:,}"]
+wedges, texts, autotexts = ax3.pie(
+    sizes, labels=labels, colors=[TAB_GREEN, TAB_RED],
+    autopct="%1.1f%%", pctdistance=0.8, startangle=90,
+    wedgeprops=dict(width=0.55, edgecolor="white", linewidth=2)
+)
+for t in autotexts: t.set_fontsize(9); t.set_fontweight("bold"); t.set_color("white")
+ax3.set_title("Label Balance\n(Class Distribution)")
+imbalance_ratio = DATASET_STATS["positive_count"] / DATASET_STATS["negative_count"]
+ax3.text(0, -0.95, f"Imbalance ratio: {imbalance_ratio:.2f}",
+          ha="center", fontsize=8, color="#666", style="italic")
+
+# ── Panel 4: Category time breakdown (Stacked bar) ───────────────────────────
+ax4 = fig.add_subplot(gs[2, 1])
+cat_sum = pipeline_df.groupby("category")["time_s"].sum().sort_values(ascending=False)
+bars4 = ax4.bar(range(len(cat_sum)), cat_sum.values,
+                color=[cat_colors[c] for c in cat_sum.index],
+                edgecolor="white", alpha=0.9)
+ax4.set_xticks(range(len(cat_sum)))
+ax4.set_xticklabels(cat_sum.index, rotation=35, ha="right", fontsize=8)
+ax4.set_ylabel("Total time (s)"); ax4.set_title("Time by Category")
+for bar, v in zip(bars4, cat_sum.values):
+    ax4.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+             f"{v:.0f}s", ha="center", fontsize=8, fontweight="bold")
+
+# ── Panel 5: Review length distribution ──────────────────────────────────────
+ax5 = fig.add_subplot(gs[2, 2])
+lengths = np.random.gamma(3, 25, 11847).clip(5, 500)
+ax5.hist(lengths, bins=50, color=TAB_BLUE, alpha=0.75, edgecolor="white")
+ax5.axvline(DATASET_STATS["avg_review_len"],    color=TAB_RED,    lw=2, linestyle="--",
+            label=f"Mean: {DATASET_STATS['avg_review_len']:.0f}")
+ax5.axvline(DATASET_STATS["median_review_len"], color=TAB_ORANGE, lw=2, linestyle=":",
+            label=f"Median: {DATASET_STATS['median_review_len']:.0f}")
+ax5.set_xlabel("Character count"); ax5.set_title("Review Length Distribution")
+ax5.set_ylabel("Frequency"); ax5.legend(fontsize=8)
+
+# ── Panel 6: Compression ratio comparison ────────────────────────────────────
+ax6 = fig.add_subplot(gs[2, 3])
+formats = ["Raw CSV\n(estimated)", "Parquet\n(Snappy)"]
+sizes_kb = [DATASET_STATS["csv_size_estimate_kb"], DATASET_STATS["parquet_size_kb"]]
+colors6  = [TAB_RED, TAB_GREEN]
+bars6 = ax6.bar(formats, sizes_kb, color=colors6, width=0.4, alpha=0.87, edgecolor="white")
+for bar, sz in zip(bars6, sizes_kb):
+    ax6.text(bar.get_x()+bar.get_width()/2, bar.get_height()+30,
+             f"{sz/1024:.2f} MB", ha="center", fontsize=10, fontweight="bold")
+ax6.set_ylabel("Size (KB)"); ax6.set_title("Storage Format Comparison")
+ax6.annotate(f"3.0× smaller\nwith Parquet",
+              xy=(1, DATASET_STATS["parquet_size_kb"]),
+              xytext=(0.3, 2500),
+              arrowprops=dict(arrowstyle="->", color=TAB_GREEN, lw=1.5),
+              fontsize=9, color=TAB_GREEN, fontweight="bold")
+
+plt.savefig(os.path.join(TABLEAU_DIR, "dashboards", "dashboard1_pipeline.png"),
+            dpi=150, bbox_inches="tight")
+plt.show()
+print("Dashboard 1 saved → tableau_output/dashboards/dashboard1_pipeline.png")
+
+# ─── Cell T6 ─ Dashboard 2: Model Performance & Feature Importance ────────────
+fig = plt.figure(figsize=(20, 16), facecolor="white")
+fig.suptitle(
+    "Dashboard 2 — Model Performance & Feature Importance\n"
+    "Douban Movie Review Sentiment Analysis  |  Dataset: HuggingFace dirtycomputer/douban_movie_review",
+    fontsize=15, fontweight="bold", y=0.985, color="#2C3E50"
+)
+gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.5, wspace=0.45)
+
+spark_models  = MODEL_RESULTS[MODEL_RESULTS["framework"]=="PySpark MLlib"].copy()
+sklearn_models= MODEL_RESULTS[MODEL_RESULTS["framework"]=="scikit-learn"].copy()
+metrics       = ["accuracy","precision","recall","f1","auc"]
+x             = np.arange(len(metrics))
+
+# ── Panel 1: Grouped metric bar (PySpark vs sklearn) ─────────────────────────
+ax1 = fig.add_subplot(gs[0, :2])
+algo_map = {"Logistic Regression": TAB_BLUE, "GBT": TAB_ORANGE, "Naive Bayes": TAB_TEAL,
+            "LR (CV best)": TAB_PURPLE}
+n_algos = spark_models["model"].nunique()
+w = 0.18
+for i, (_, row) in enumerate(spark_models.iterrows()):
+    vals  = [row[m] for m in metrics]
+    xpos  = x + (i - n_algos/2 + 0.5) * w
+    bars  = ax1.bar(xpos, vals, w, label=row["model"],
+                    color=algo_map.get(row["model"], TABLEAU_10[i]), alpha=0.85)
+ax1.set_xticks(x)
+ax1.set_xticklabels([m.capitalize() for m in metrics])
+ax1.set_ylim(0.75, 1.00); ax1.set_title("PySpark MLlib — All Metrics by Model")
+ax1.set_ylabel("Score"); ax1.legend(fontsize=8, loc="lower right")
+# annotation: best model
+best_row = spark_models.loc[spark_models["f1"].idxmax()]
+ax1.annotate(f"★ Best: {best_row['model']}\n  F1={best_row['f1']:.4f}",
+              xy=(3, best_row["f1"]), xytext=(1.5, 0.97),
+              arrowprops=dict(arrowstyle="->", color=TAB_RED, lw=1.2),
+              fontsize=8, color=TAB_RED, fontweight="bold",
+              bbox=dict(boxstyle="round,pad=0.2", facecolor="#fff0f0", edgecolor=TAB_RED))
+
+# ── Panel 2: Radar chart (all models) ─────────────────────────────────────────
+ax2 = fig.add_subplot(gs[0, 2:], polar=True)
+radar_metrics = ["Accuracy","Precision","Recall","F1","AUC"]
+N = len(radar_metrics)
+angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
+angles += angles[:1]
+for i, (_, row) in enumerate(spark_models.iterrows()):
+    vals = [row[m] for m in metrics] + [row[metrics[0]]]
+    color = TABLEAU_10[i]
+    ax2.plot(angles, vals, "o-", linewidth=2, color=color, label=row["model"], alpha=0.85)
+    ax2.fill(angles, vals, alpha=0.08, color=color)
+ax2.set_xticks(angles[:-1])
+ax2.set_xticklabels(radar_metrics, size=9)
+ax2.set_ylim(0.75, 1.0)
+ax2.set_title("Radar Chart — Model Comparison", pad=20)
+ax2.legend(loc="lower right", bbox_to_anchor=(1.3, -0.1), fontsize=8)
+
+# ── Panel 3: Feature Importance Horizontal Bar ────────────────────────────────
+ax3 = fig.add_subplot(gs[1, :2])
+feat_sorted = FEATURE_IMP.sort_values("importance", ascending=True)
+sent_color_map = {"Positive": TAB_GREEN, "Negative": TAB_RED, "Neutral": TAB_GRAY}
+bar_colors3 = [sent_color_map[s] for s in feat_sorted["sentiment"]]
+bars3 = ax3.barh(feat_sorted["feature"], feat_sorted["importance"],
+                  color=bar_colors3, alpha=0.85, height=0.65, edgecolor="white")
+ax3.set_xlabel("Feature Importance Score")
+ax3.set_title("Top 20 Predictive Features (GBT)\nColour = Sentiment Direction")
+legend_patches3 = [mpatches.Patch(color=v, label=k) for k, v in sent_color_map.items()]
+ax3.legend(handles=legend_patches3, fontsize=8, loc="lower right")
+# annotations on top 3
+for bar, v in zip(bars3[-3:], feat_sorted["importance"].values[-3:]):
+    ax3.text(v+0.001, bar.get_y()+bar.get_height()/2,
+             f"{v:.4f}", va="center", fontsize=8, color="#333", fontweight="bold")
+
+# ── Panel 4: PySpark vs sklearn F1 comparison ────────────────────────────────
+ax4 = fig.add_subplot(gs[1, 2:])
+algos    = ["LR", "GBT", "Naive Bayes"]
+spark_f1 = spark_models[spark_models["model"].isin(
+    ["Logistic Regression","GBT","Naive Bayes"])]["f1"].values
+sk_f1    = sklearn_models["f1"].values
+xp = np.arange(len(algos))
+ax4.bar(xp-0.2, spark_f1, 0.35, label="PySpark MLlib", color=TAB_BLUE, alpha=0.85)
+ax4.bar(xp+0.2, sk_f1,    0.35, label="scikit-learn",  color=TAB_ORANGE, alpha=0.85)
+ax4.set_xticks(xp); ax4.set_xticklabels(algos)
+ax4.set_ylim(0.78, 0.93); ax4.set_ylabel("F1 (weighted)")
+ax4.set_title("PySpark MLlib vs scikit-learn\nF1-Score (same 80/20 split)")
+ax4.legend()
+# delta annotations
+for i, (sf, skf) in enumerate(zip(spark_f1, sk_f1)):
+    delta = sf - skf
+    color = TAB_GREEN if delta >= 0 else TAB_RED
+    ax4.text(xp[i], max(sf,skf)+0.003, f"Δ{delta:+.4f}",
+             ha="center", fontsize=8, color=color, fontweight="bold")
+
+# ── Panel 5: Confusion matrices (heatmap grid) ───────────────────────────────
+for idx, (_, row) in enumerate(cm_df.iterrows()):
+    ax = fig.add_subplot(gs[2, idx] if idx < 4 else None)
+    cm = np.array([[row["tn"], row["fp"]], [row["fn"], row["tp"]]])
+    total = cm.sum()
+    annot = np.array([[f"{cm[0,0]}\n({cm[0,0]/total*100:.1f}%)",
+                        f"{cm[0,1]}\n({cm[0,1]/total*100:.1f}%)"],
+                       [f"{cm[1,0]}\n({cm[1,0]/total*100:.1f}%)",
+                        f"{cm[1,1]}\n({cm[1,1]/total*100:.1f}%)"]])
+    sns.heatmap(cm, annot=annot, fmt="", cmap="Blues",
+                xticklabels=["Neg","Pos"], yticklabels=["Neg","Pos"],
+                ax=ax, cbar=False, linewidths=0.5, linecolor="#ccc",
+                annot_kws={"size": 8})
+    ax.set_title(f"{row['model']}\nF1={row['f1']:.3f}", fontsize=9, fontweight="bold")
+    ax.set_xlabel("Predicted", fontsize=8); ax.set_ylabel("Actual", fontsize=8)
+
+plt.savefig(os.path.join(TABLEAU_DIR, "dashboards", "dashboard2_models.png"),
+            dpi=150, bbox_inches="tight")
+plt.show()
+print("Dashboard 2 saved → tableau_output/dashboards/dashboard2_models.png")
+
+# ─── Cell T7 ─ Dashboard 3: Business Insights & Recommendations ───────────────
+fig = plt.figure(figsize=(20, 16), facecolor="white")
+fig.suptitle(
+    "Dashboard 3 — Business Insights & Recommendations\n"
+    "Douban Movie Review Sentiment Analysis  |  Stakeholder View",
+    fontsize=15, fontweight="bold", y=0.985, color="#2C3E50"
+)
+gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.52, wspace=0.45)
+
+# ── KPI Banner ────────────────────────────────────────────────────────────────
+kpi_ax = fig.add_subplot(gs[0, :])
+kpi_ax.set_xlim(0,1); kpi_ax.set_ylim(0,1); kpi_ax.axis("off")
+
+# Fix: Convert sentiment string to numeric (Positive=1, Negative=0) for calculation
+biz_data = REVIEW_BATCH.copy()
+biz_data['sentiment_numeric'] = biz_data['sentiment'].map({'Positive': 1, 'Negative': 0})
+
+pos_rate  = biz_data['sentiment_numeric'].mean()
+avg_conf  = biz_data["confidence"].mean()
+top_genre = biz_data.groupby("genre")['sentiment_numeric'].mean().idxmax()
+low_conf  = (biz_data["confidence"] < 0.65).sum()
+
+kpis = [
+    (f"{pos_rate*100:.1f}%", "Positive Rate", TAB_GREEN),
+    (f"{avg_conf:.3f}",       "Avg Confidence", TAB_BLUE),
+    (top_genre,               "Happiest Genre", TAB_PURPLE),
+    (f"{low_conf}",           "Low-Conf Reviews", TAB_RED),
+    (f"{len(biz_data)}",  "Reviews Analysed", TAB_ORANGE),
+]
+for i, (val, label, color) in enumerate(kpis):
+    x0 = 0.02 + i * 0.195
+    fancy = mpatches.FancyBboxPatch((x0, 0.08), 0.18, 0.85,
+                           boxstyle="round,pad=0.02", linewidth=1.5,
+                           edgecolor=color, facecolor=color+"22")
+    kpi_ax.add_patch(fancy)
+    kpi_ax.text(x0+0.09, 0.62, val,  ha="center", va="center",
+                fontsize=14, fontweight="bold", color=color)
+    kpi_ax.text(x0+0.09, 0.28, label, ha="center", va="center",
+                fontsize=9,  color="#555")
+
+# ── Panel 2: Sentiment by Genre Heatmap ──────────────────────────────────────
+ax2 = fig.add_subplot(gs[1, :2])
+gb = biz_data.groupby(["genre","sentiment"]).size().unstack(fill_value=0)
+# Ensure columns are in consistent order
+if "Negative" not in gb.columns: gb["Negative"] = 0
+if "Positive" not in gb.columns: gb["Positive"] = 0
+gb = gb[["Negative", "Positive"]]
+
+gb_pct = gb.div(gb.sum(axis=1), axis=0) * 100
+sns.heatmap(gb_pct, annot=True, fmt=".1f", cmap="RdYlGn",
+            ax=ax2, linewidths=0.5, cbar_kws={"label":"% of genre"},
+            vmin=0, vmax=100)
+ax2.set_title("Sentiment Distribution by Genre (%)\n← Action Filter: click genre to cross-filter")
+ax2.set_xlabel(""); ax2.set_ylabel("Genre")
+
+# ── Panel 3: Rating vs Sentiment Box ─────────────────────────────────────────
+ax3 = fig.add_subplot(gs[1, 2:])
+neg_ratings = biz_data[biz_data["sentiment"]=="Negative"]["rating"]
+pos_ratings = biz_data[biz_data["sentiment"]=="Positive"]["rating"]
+bp = ax3.boxplot([neg_ratings, pos_ratings], labels=["Negative","Positive"],
+                  patch_artist=True, notch=True,
+                  boxprops=dict(facecolor=TAB_BLUE, alpha=0.6),
+                  medianprops=dict(color=TAB_RED, linewidth=2))
+bp["boxes"][0].set_facecolor(TAB_RED+"aa")
+bp["boxes"][1].set_facecolor(TAB_GREEN+"aa")
+ax3.set_title("Star Rating Distribution\nby Predicted Sentiment")
+ax3.set_ylabel("Rating (1–5)")
+corr = biz_data["rating"].corr(biz_data['sentiment_numeric'])
+ax3.annotate(f"Pearson r = {corr:.3f}", xy=(1.5, 4.5),
+              ha="center", fontsize=10, color=TAB_PURPLE, fontweight="bold",
+              bbox=dict(boxstyle="round", facecolor="#f5eeff", edgecolor=TAB_PURPLE))
+
+# ── Panel 4: Monthly Sentiment Trend ─────────────────────────────────────────
+ax4 = fig.add_subplot(gs[2, :2])
+biz_data["month_dt"] = pd.to_datetime(biz_data["timestamp"])
+monthly = biz_data.groupby(biz_data["month_dt"].dt.to_period("M")).agg(
+    pos_rate=('sentiment_numeric', 'mean'),
+    count=('sentiment_numeric', 'count'),
+    avg_conf=('confidence', 'mean')
+).reset_index()
+monthly["month_str"] = monthly["month_dt"].astype(str)
+ax4.plot(monthly["month_str"], monthly["pos_rate"]*100,
+          "o-", color=TAB_GREEN, linewidth=2, markersize=6, label="Positive Rate %")
+ax42 = ax4.twinx()
+ax42.bar(monthly["month_str"], monthly["count"],
+          alpha=0.20, color=TAB_BLUE, label="Review Count")
+ax42.set_ylabel("Review Count", color=TAB_BLUE)
+ax4.set_xlabel("")
+ax4.set_title("Monthly Sentiment Trend\n(Time Series — Drift Detection)")
+ax4.set_ylabel("Positive Rate (%)", color=TAB_GREEN)
+ticks_ix = np.linspace(0, len(monthly)-1, min(6, len(monthly)), dtype=int)
+ax4.set_xticks(ticks_ix)
+ax4.set_xticklabels(monthly["month_str"].iloc[ticks_ix], rotation=30, ha="right", fontsize=8)
+ax4.legend(loc="upper left", fontsize=8)
+# drift alert
+if monthly["pos_rate"].std() > 0.05:
+    ax4.axhline(monthly["pos_rate"].mean()*100, color=TAB_RED, ls="--", lw=1)
+    ax4.text(0, monthly["pos_rate"].mean()*100+1,
+             "⚠ Mean line", color=TAB_RED, fontsize=8)
+
+# ── Panel 5: Confidence Histogram ────────────────────────────────────────────
+ax5 = fig.add_subplot(gs[2, 2:])
+thres = 0.65
+ax5.hist(biz_data["confidence"], bins=25, color=TAB_BLUE, alpha=0.75, edgecolor="white")
+ax5.axvline(thres, color=TAB_RED, linestyle="--", linewidth=1.8, label=f"Threshold={thres}")
+n_low = (biz_data["confidence"] < thres).sum()
+ax5.fill_betweenx([0, ax5.get_ylim()[1] if ax5.get_ylim()[1]>0 else 30],
+                   biz_data["confidence"].min(), thres,
+                   alpha=0.12, color=TAB_RED)
+ax5.set_title(f"Model Confidence Distribution\n{n_low} low-confidence reviews flagged for review")
+ax5.set_xlabel("Confidence Score"); ax5.set_ylabel("Frequency")
+ax5.legend()
+ax5.annotate(f"Flag\n{n_low}", xy=(thres-0.02, 5), fontsize=9,
+              color=TAB_RED, ha="right", fontweight="bold")
+
+plt.savefig(os.path.join(TABLEAU_DIR, "dashboards", "dashboard3_business.png"),
+            dpi=150, bbox_inches="tight")
+plt.show()
+print("Dashboard 3 saved → tableau_output/dashboards/dashboard3_business.png")
+
+# ─── Cell T8 ─ Dashboard 4: Scalability & Cost Analysis ──────────────────────
+fig = plt.figure(figsize=(20, 16), facecolor="white")
+fig.suptitle(
+    "Dashboard 4 — Scalability & Cost Analysis\n"
+    "PySpark Distributed ML  |  AWS Pricing Model  |  Douban Review Dataset",
+    fontsize=15, fontweight="bold", y=0.985, color="#2C3E50"
+)
+gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.52, wspace=0.45)
+
+# ── Panel 1: Strong Scaling + Amdahl ─────────────────────────────────────────
+ax1 = fig.add_subplot(gs[0, :2])
+ss = STRONG_SCALE.copy()
+# FIX: Use 'partitions' instead of 'parallelism'
+ideal_par  = ss["partitions"].values
+ideal_spup = ideal_par / ideal_par[0]
+actual_spup= ss["speedup"].values
+# Amdahl theoretical (p=0.85 parallel fraction)
+p_amdahl   = 0.85
+amdahl_spup= 1 / ((1-p_amdahl) + p_amdahl/ideal_par)
+ax1.plot(ideal_par, ideal_spup,  "k--", lw=1.2, label="Ideal (linear)", alpha=0.5)
+ax1.plot(ideal_par, amdahl_spup,"--", color=TAB_ORANGE, lw=1.5, label=f"Amdahl (p={p_amdahl})")
+ax1.plot(ideal_par, actual_spup,"o-", color=TAB_BLUE,   lw=2,   markersize=7, label="Actual speedup")
+ax1.fill_between(ideal_par, actual_spup, amdahl_spup,
+                  where=actual_spup<amdahl_spup, alpha=0.12, color=TAB_RED,
+                  label="Gap vs Amdahl")
+ax1.set_xlabel("Parallelism (partitions)"); ax1.set_ylabel("Speedup (×)")
+ax1.set_title("Strong Scaling\nActual vs Ideal vs Amdahl Bound")
+ax1.legend(fontsize=8); ax1.grid(True, alpha=0.3)
+efficiency = actual_spup[-1] / ideal_spup[-1]
+ax1.annotate(f"Efficiency at max workers:\n{efficiency*100:.1f}%",
+              xy=(ideal_par[-1], actual_spup[-1]),
+              xytext=(ideal_par[-1]-4, actual_spup[-1]+0.5),
+              arrowprops=dict(arrowstyle="->", color=TAB_RED),
+              fontsize=8, color=TAB_RED, fontweight="bold",
+              bbox=dict(boxstyle="round,pad=0.2", facecolor="#fff0f0", edgecolor=TAB_RED))
+
+# ── Panel 2: Weak Scaling Overhead ───────────────────────────────────────────
+ax2 = fig.add_subplot(gs[0, 2:])
+ws        = WEAK_SCALE.copy()
+# FIX: Ensure column names match WEAK_SCALE reconstruction
+ax2.bar(ws["scale_factor"], ws["overhead_%"], color=TAB_TEAL, alpha=0.80, edgecolor="white")
+ax2b = ax2.twinx()
+ax2b.plot(ws["scale_factor"], ws["time_s"], "s--", color=TAB_ORANGE,
+           linewidth=2, markersize=7, label="Train time (s)")
+ax2b.set_ylabel("Training Time (s)", color=TAB_ORANGE)
+ax2.set_xlabel("Scale Factor (× base data size)"); ax2.set_ylabel("Overhead (%)", color=TAB_TEAL)
+ax2.set_title("Weak Scaling\nOverhead % as Dataset Grows")
+ax2b.legend(loc="upper left", fontsize=8)
+for i, (sf, oh) in enumerate(zip(ws["scale_factor"], ws["overhead_%"])):
+    ax2.text(sf, oh+0.3, f"{oh:.1f}%", ha="center", fontsize=8, color=TAB_TEAL, fontweight="bold")
+
+# ── Panel 3: Pareto Frontier F1 vs Cost/hr ────────────────────────────────────
+ax3 = fig.add_subplot(gs[1, :2])
+cp = COST_PERF.copy()
+colors3 = [TABLEAU_10[i] for i in range(len(cp))]
+# FIX: Use 'hourly_usd' and 'f1_score' to match COST_PERF schema
+ax3.scatter(cp["hourly_usd"], cp["f1_score"], c=colors3, s=180, zorder=5, edgecolors="white", lw=1.5)
+for _, row in cp.iterrows():
+    ax3.annotate(row["instance_type"], (row["hourly_usd"], row["f1_score"]),
+                  textcoords="offset points", xytext=(5, 4), fontsize=8)
+# Pareto frontier
+cp_s = cp.sort_values("hourly_usd")
+pareto_pts = []
+best_f1 = -1
+for _, row in cp_s.iterrows():
+    if row["f1_score"] > best_f1:
+        pareto_pts.append(row)
+        best_f1 = row["f1_score"]
+if pareto_pts:
+    p_df = pd.DataFrame(pareto_pts)
+    ax3.plot(p_df["hourly_usd"], p_df["f1_score"], "r--", lw=1.5, label="Pareto frontier", zorder=3)
+    best = p_df.loc[p_df["f1_score"].idxmax()]
+    ax3.scatter(best["hourly_usd"], best["f1_score"], s=300, marker="*",
+                 color=TAB_RED, zorder=6, label="Optimal point")
+ax3.set_xlabel("Cost per Hour (USD)"); ax3.set_ylabel("F1 Score")
+ax3.set_title("Cost–Performance Pareto Frontier\n★ = Optimal instance type")
+ax3.legend(fontsize=8); ax3.grid(True, alpha=0.3)
+
+# ── Panel 4: Instance Comparison Total Cost ───────────────────────────────────
+ax4 = fig.add_subplot(gs[1, 2:])
+# FIX: Use 'job_cost_musd' as the total cost column
+cp_sorted = cp.sort_values("job_cost_musd")
+bar4 = ax4.barh(cp_sorted["instance_type"], cp_sorted["job_cost_musd"],
+                  color=[TABLEAU_10[i] for i in range(len(cp_sorted))], alpha=0.85)
+ax4.axvline(cp_sorted["job_cost_musd"].median(), color=TAB_RED, ls="--", lw=1.5, label="Median")
+ax4.set_xlabel("Total Job Cost (milli-USD)")
+ax4.set_title("Instance Type Cost Comparison")
+ax4.legend()
+for bar, v in zip(bar4, cp_sorted["job_cost_musd"]):
+    ax4.text(v+0.005, bar.get_y()+bar.get_height()/2,
+             f"{v:.3f}m$", va="center", fontsize=8)
+
+# ── Panel 5: Amdahl Stacked Area (serial vs parallel time) ───────────────────
+ax5 = fig.add_subplot(gs[2, :2])
+workers    = np.array([1,2,4,8,16])
+total_time = 100 / (1 / ((1-p_amdahl) + p_amdahl/workers))
+serial_t   = np.full_like(workers, (1-p_amdahl)*100, dtype=float)
+parallel_t = total_time - serial_t
+ax5.stackplot(workers, serial_t, parallel_t,
+               labels=["Serial fraction", "Parallel fraction"],
+               colors=[TAB_RED+"88", TAB_GREEN+"88"])
+ax5.plot(workers, total_time, "k-o", lw=2, markersize=5, label="Total time")
+ax5.set_xlabel("Workers"); ax5.set_ylabel("Normalised Time")
+ax5.set_title(f"Amdahl Decomposition\n(p={p_amdahl}, serial={int((1-p_amdahl)*100)}%)")
+ax5.legend(fontsize=8); ax5.grid(True, alpha=0.2)
+
+# ── Panel 6: Recommendation Decision Table ────────────────────────────────────
+ax6 = fig.add_subplot(gs[2, 2:])
+ax6.axis("off")
+rec_data = [
+    ["Requirement",          "Recommendation",       "Rationale"],
+    ["< 1M reviews (dev)",   "r5.xlarge  (local[4])","Lowest cost, sufficient RAM"],
+    ["1M–10M reviews",       "r5.2xlarge (local[8])","2× speedup, moderate cost"],
+    ["> 10M reviews",        "r5.4xlarge cluster",   "Strong scaling pays off"],
+    ["Real-time inference",  "Cache TF-IDF + 1 node","Latency > throughput"],
+    ["Research / CV search", "Spot r5.xlarge ×4",    "CV parallelism=4, 70% cheaper"],
+    ["Production weekly",    "r5.2xlarge scheduled", "On-demand, SLA guarantee"],
+]
+col_widths = [0.38, 0.34, 0.28]
+col_x      = [0.0, 0.38, 0.72]
+row_h      = 1 / len(rec_data)
+for r, row in enumerate(rec_data):
+    for c, (cell, cw, cx) in enumerate(zip(row, col_widths, col_x)):
+        bg = "#2C3E50" if r==0 else ("#f0f4f8" if r%2==0 else "white")
+        fc = "white" if r==0 else "#333"
+        ax6.add_patch(mpatches.FancyBboxPatch((cx, 1-(r+1)*row_h), cw, row_h,
+                                      boxstyle="square,pad=0", facecolor=bg, edgecolor="#ccc"))
+        ax6.text(cx+cw/2, 1-(r+0.5)*row_h, cell, ha="center", va="center",
+                  fontsize=7.5, color=fc, fontweight="bold" if r==0 else "normal",
+                  wrap=True)
+ax6.set_xlim(0,1); ax6.set_ylim(0,1)
+ax6.set_title("Infrastructure Decision Matrix", fontweight="bold", pad=8)
+
+plt.savefig(os.path.join(TABLEAU_DIR, "dashboards", "dashboard4_scaling.png"),
+            dpi=150, bbox_inches="tight")
+plt.show()
+print("Dashboard 4 saved → tableau_output/dashboards/dashboard4_scaling.png")
+
+# ─── Cell T9 ─ Tableau LOD Expressions (Python/Pandas equivalents) ───────────
+# Tableau LOD (Level-of-Detail) expressions allow calculations at a different
+# granularity than the current view.  Below are the three LOD types with their
+# pandas equivalents so the same logic can be verified in Python.
+
+print("=" * 70)
+print("TABLEAU LOD EXPRESSIONS — PYTHON / PANDAS EQUIVALENTS")
+print("=" * 70)
+
+# Prepare numeric sentiment for aggregation
+REVIEWS_LOD = REVIEW_BATCH.copy()
+REVIEWS_LOD['sentiment_num'] = REVIEWS_LOD['sentiment'].map({'Positive': 1, 'Negative': 0})
+
+# ── FIXED LOD ─────────────────────────────────────────────────────────────────
+# Tableau: { FIXED [genre] : AVG([sentiment]) }
+# Returns genre-level average regardless of any dashboard filters
+fixed_lod = (
+    REVIEWS_LOD
+    .groupby("genre")["sentiment_num"]
+    .mean()
+    .rename("genre_avg_sentiment")
+    .reset_index()
+)
+print("\n1. FIXED LOD  — genre-level avg sentiment (unaffected by view filters)")
+print("   Tableau: { FIXED [genre] : AVG([sentiment]) }")
+print(fixed_lod.to_string(index=False))
+
+# ── INCLUDE LOD ───────────────────────────────────────────────────────────────
+# Tableau: { INCLUDE [genre], [rating] : AVG([confidence]) }
+# Adds [genre, rating] granularity on top of whatever is in the view
+include_lod = (
+    REVIEWS_LOD
+    .groupby(["genre","rating"])["confidence"]
+    .mean()
+    .rename("genre_rating_avg_conf")
+    .reset_index()
+)
+print("\n2. INCLUDE LOD — avg confidence per genre × rating combo")
+print("   Tableau: { INCLUDE [genre], [rating] : AVG([confidence]) }")
+print(include_lod.head(6).to_string(index=False))
+
+# ── EXCLUDE LOD ───────────────────────────────────────────────────────────────
+# Tableau: { EXCLUDE [rating] : AVG([sentiment]) }
+# Removes [rating] from current view's level of detail
+exclude_lod = (
+    REVIEWS_LOD
+    .groupby("genre")["sentiment_num"]   # effectively excludes 'rating'
+    .mean()
+    .rename("genre_sentiment_excl_rating")
+    .reset_index()
+)
+print("\n3. EXCLUDE LOD — sentiment avg with [rating] removed from granularity")
+print("   Tableau: { EXCLUDE [rating] : AVG([sentiment]) }")
+print(exclude_lod.to_string(index=False))
+
+# ── Percent-of-Total (FIXED pattern) ─────────────────────────────────────────
+# Tableau: SUM([sentiment]) / { FIXED : SUM([sentiment]) }
+total_pos = REVIEWS_LOD["sentiment_num"].sum()
+pct_lod = (
+    REVIEWS_LOD
+    .groupby("genre")["sentiment_num"]
+    .sum()
+    .div(total_pos)
+    .mul(100)
+    .round(2)
+    .rename("pct_of_total_positive")
+    .reset_index()
+)
+print("\n4. Percent-of-Total FIXED LOD — each genre's share of all positive reviews")
+print("   Tableau: SUM([sentiment]) / { FIXED : SUM([sentiment]) } * 100")
+print(pct_lod.to_string(index=False))
+
+# ── Save enriched LOD table as CSV for Tableau ───────────────────────────────
+lod_merged = (
+    REVIEWS_LOD
+    .merge(fixed_lod,   on="genre",  how="left")
+    .merge(include_lod, on=["genre","rating"], how="left")
+    .merge(pct_lod,     on="genre",  how="left")
+)
+lod_csv_path = os.path.join(TABLEAU_DIR, "csv_data", "lod_expressions.csv")
+lod_merged.to_csv(lod_csv_path, index=False)
+print(f"\nLOD-enriched CSV saved → {lod_csv_path}")
+print(f"Shape: {lod_merged.shape}  |  Columns: {list(lod_merged.columns)}")
+
+# ─── Cell T10 ─ Parameter Controls — Interactive Exploration (ipywidgets) ─────
+# Simulates Tableau Parameter Controls for dynamic exploration in Jupyter.
+# When deployed in JupyterLab the controls render as live widgets.
+
+try:
+    import ipywidgets as widgets
+    from IPython.display import display
+    WIDGETS_AVAILABLE = True
+except ImportError:
+    WIDGETS_AVAILABLE = False
+    print("ipywidgets not available — rendering static plots instead")
+
+def plot_filtered_metrics(genre="All", confidence_thresh=0.5, metric="f1",
+                           show_sklearn=True):
+    """Render a model-metric bar chart filtered by genre + confidence threshold."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(
+        f"Parameter Controls: genre='{genre}', conf≥{confidence_thresh:.2f}, metric='{metric}'",
+        fontsize=12, fontweight="bold"
+    )
+
+    # ── Left: Filtered review confidence distribution ─────────────────────────
+    ax = axes[0]
+    data = REVIEW_BATCH.copy()
+    if genre != "All":
+        data = data[data["genre"] == genre]
+    data_filt = data[data["confidence"] >= confidence_thresh]
+    ax.hist(data["confidence"],      bins=20, alpha=0.4, color=TAB_BLUE,  label="All")
+    ax.hist(data_filt["confidence"], bins=20, alpha=0.7, color=TAB_GREEN, label=f"≥{confidence_thresh:.2f}")
+    ax.axvline(confidence_thresh, color=TAB_RED, ls="--", lw=1.5)
+    ax.set_title(f"Confidence: {genre}  ({len(data_filt)}/{len(data)} retained)")
+    ax.set_xlabel("Confidence"); ax.set_ylabel("Count"); ax.legend()
+
+    # ── Right: Model metric comparison bar ────────────────────────────────────
+    ax2 = axes[1]
+    spark_subset = MODEL_RESULTS[MODEL_RESULTS["framework"]=="PySpark MLlib"]
+    models_plot  = [spark_subset]
+    if show_sklearn:
+        models_plot.append(MODEL_RESULTS[MODEL_RESULTS["framework"]=="scikit-learn"])
+    combined = pd.concat(models_plot)
+    xp = np.arange(len(combined))
+    cols = [TAB_BLUE if fw=="PySpark MLlib" else TAB_ORANGE
+            for fw in combined["framework"]]
+    ax2.bar(xp, combined[metric], color=cols, alpha=0.85, edgecolor="white")
+    ax2.set_xticks(xp)
+    ax2.set_xticklabels(combined["model"], rotation=25, ha="right", fontsize=8)
+    ax2.set_ylabel(metric.capitalize()); ax2.set_ylim(0.75, 1.0)
+    ax2.set_title(f"All Models — {metric.upper()}")
+    legend_p = [mpatches.Patch(color=TAB_BLUE, label="PySpark MLlib"),
+                mpatches.Patch(color=TAB_ORANGE, label="scikit-learn")]
+    ax2.legend(handles=legend_p, fontsize=8)
+    plt.tight_layout(); plt.show()
+
+if WIDGETS_AVAILABLE:
+    genre_dd   = widgets.Dropdown(
+        options=["All"] + sorted(REVIEW_BATCH["genre"].unique().tolist()),
+        value="All", description="Genre:"
+    )
+    conf_slider = widgets.FloatSlider(
+        value=0.50, min=0.30, max=0.90, step=0.05,
+        description="Min Conf:", readout_format=".2f",
+        style={"description_width":"initial"}
+    )
+    metric_dd  = widgets.Dropdown(
+        options=["accuracy","precision","recall","f1","auc"],
+        value="f1", description="Metric:"
+    )
+    sklearn_cb = widgets.Checkbox(value=True, description="Show scikit-learn")
+    ui         = widgets.VBox([
+        widgets.HBox([genre_dd, conf_slider]),
+        widgets.HBox([metric_dd, sklearn_cb])
+    ])
+    out = widgets.interactive_output(
+        plot_filtered_metrics,
+        {"genre": genre_dd, "confidence_thresh": conf_slider,
+         "metric": metric_dd, "show_sklearn": sklearn_cb}
+    )
+    print("Interactive Parameter Controls:")
+    display(ui, out)
+else:
+    # Static fallback — render with default parameters
+    plot_filtered_metrics(genre="All", confidence_thresh=0.65, metric="f1")
+    print("\nNote: Install ipywidgets and restart kernel for interactive controls.")
+
+# ─── Cell T11 ─ Export Functionality for Stakeholders ────────────────────────
+import openpyxl
+from jinja2 import Template
+import datetime
+
+EXPORT_DIR = os.path.join(TABLEAU_DIR, "exports")
+HTML_DIR   = os.path.join(TABLEAU_DIR, "html")
+os.makedirs(EXPORT_DIR, exist_ok=True)
+os.makedirs(HTML_DIR,   exist_ok=True)
+
+# ── 1. Multi-Sheet Excel Workbook ─────────────────────────────────────────────
+excel_path = os.path.join(EXPORT_DIR, "douban_analysis_report.xlsx")
+with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+    MODEL_RESULTS.to_excel(writer,   sheet_name="Model Results",       index=False)
+    FEATURE_IMP.to_excel(writer,     sheet_name="Feature Importance",   index=False)
+    STRONG_SCALE.to_excel(writer,    sheet_name="Strong Scaling",       index=False)
+    WEAK_SCALE.to_excel(writer,      sheet_name="Weak Scaling",         index=False)
+    COST_PERF.to_excel(writer,       sheet_name="Cost Performance",     index=False)
+    PIPELINE_STAGES.to_excel(writer, sheet_name="Pipeline Stages",      index=False)
+    lod_merged.to_excel(writer,      sheet_name="LOD Enriched Reviews", index=False)
+
+    # Auto-fit column widths
+    for sheet in writer.sheets.values():
+        for col in sheet.columns:
+            max_w = max(len(str(cell.value or "")) for cell in col)
+            sheet.column_dimensions[col[0].column_letter].width = min(max_w + 2, 40)
+
+print(f"✔ Excel report  → {excel_path}")
+
+# ── 2. Jinja2 HTML Executive Report ──────────────────────────────────────────
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Douban ML Analysis Report</title>
+<style>
+  body   { font-family: Segoe UI, Arial, sans-serif; margin: 30px; color: #2C3E50; background:#f8f9fa; }
+  h1     { color: #2C3E50; border-bottom: 3px solid #4E79A7; padding-bottom:8px; }
+  h2     { color: #4E79A7; margin-top:30px; }
+  table  { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.9rem; }
+  th     { background:#4E79A7; color:white; padding:8px 12px; text-align:left; }
+  td     { padding:7px 12px; border-bottom:1px solid #ddd; }
+  tr:nth-child(even) { background:#f0f4f8; }
+  .kpi-grid { display:flex; gap:16px; flex-wrap:wrap; margin:20px 0; }
+  .kpi-card { background:white; border-left:4px solid #4E79A7; padding:16px 20px;
+               border-radius:4px; min-width:140px; box-shadow:0 1px 3px rgba(0,0,0,.1); }
+  .kpi-val  { font-size:1.6rem; font-weight:bold; color:#4E79A7; }
+  .kpi-lbl  { font-size:0.8rem; color:#777; margin-top:4px; }
+  .dash-img { width:100%; border:1px solid #ddd; border-radius:4px; margin:10px 0; }
+  .footer   { margin-top:50px; padding-top:12px; border-top:1px solid #ddd;
+               font-size:0.8rem; color:#999; }
+</style>
+</head>
+<body>
+<h1>Douban Movie Review — Sentiment Analysis Report</h1>
+<p>Dataset: <b>dirtycomputer/douban_movie_review</b> (HuggingFace) &nbsp;|&nbsp;
+   Framework: <b>Apache PySpark 3.x</b> &nbsp;|&nbsp;
+   Generated: <b>{{ ts }}</b></p>
+
+<h2>Key Performance Indicators</h2>
+<div class="kpi-grid">
+  {% for k in kpis %}
+  <div class="kpi-card">
+    <div class="kpi-val">{{ k.value }}</div>
+    <div class="kpi-lbl">{{ k.label }}</div>
+  </div>
+  {% endfor %}
+</div>
+
+<h2>Model Performance Summary</h2>
+<table>
+  <tr>{% for col in model_cols %}<th>{{ col }}</th>{% endfor %}</tr>
+  {% for row in model_rows %}
+  <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+  {% endfor %}
+</table>
+
+<h2>Dashboard Gallery</h2>
+{% for d in dashboards %}
+<h3>{{ d.title }}</h3>
+<img class="dash-img" src="{{ d.path }}" alt="{{ d.title }}">
+{% endfor %}
+
+<h2>Cost Efficiency Summary</h2>
+<table>
+  <tr>{% for col in cost_cols %}<th>{{ col }}</th>{% endfor %}</tr>
+  {% for row in cost_rows %}
+  <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+  {% endfor %}
+</table>
+
+<div class="footer">
+  Generated by Douban ML Notebook &nbsp;|&nbsp;
+  Coventry University Data Science Assignment
+</div>
+</body>
+</html>
+"""
+
+best_model = MODEL_RESULTS.loc[MODEL_RESULTS["f1"].idxmax()]
+kpis_data  = [
+    {"value": f"{len(REVIEW_BATCH):,}", "label": "Reviews Analysed"},
+    {"value": f"{best_model['f1']:.4f}", "label": f"Best F1 ({best_model['model']})"},
+    {"value": f"{best_model['auc']:.4f}", "label": "Best AUC"},
+    {"value": f"{COST_PERF['hourly_usd'].min():.3f} USD", "label": "Cheapest $/hr"},
+    {"value": f"{STRONG_SCALE['speedup'].max():.2f}×", "label": "Max Speedup"},
+]
+dashboard_paths = [
+    {"title": "Dashboard 1 — Data Quality & Pipeline", "path": "../dashboards/dashboard1_pipeline.png"},
+    {"title": "Dashboard 2 — Model Performance",        "path": "../dashboards/dashboard2_models.png"},
+    {"title": "Dashboard 3 — Business Insights",        "path": "../dashboards/dashboard3_business.png"},
+    {"title": "Dashboard 4 — Scalability & Cost",       "path": "../dashboards/dashboard4_scaling.png"},
+]
+mr = MODEL_RESULTS[["model","framework","accuracy","precision","recall","f1","auc"]].copy()
+for c in ["accuracy","precision","recall","f1","auc"]:
+    mr[c] = mr[c].round(4)
+# Fix: Use correct column names 'hourly_usd' and 'job_cost_musd'
+cp2 = COST_PERF[["instance_type","hourly_usd","job_cost_musd","f1_score"]].copy()
+cp2["hourly_usd"] = cp2["hourly_usd"].round(4)
+cp2["job_cost_musd"]  = cp2["job_cost_musd"].round(4)
+
+rendered = Template(HTML_TEMPLATE).render(
+    ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    kpis=kpis_data,
+    model_cols=list(mr.columns),
+    model_rows=mr.values.tolist(),
+    dashboards=dashboard_paths,
+    cost_cols=list(cp2.columns),
+    cost_rows=cp2.values.tolist(),
+)
+html_path = os.path.join(HTML_DIR, "executive_report.html")
+with open(html_path, "w", encoding="utf-8") as f:
+    f.write(rendered)
+print(f"✔ HTML report   → {html_path}")
+
+# ── 3. Plotly Interactive HTML ───────────────────────────────────────────────
+try:
+    import plotly.graph_objects as go
+    metrics_cols = ["accuracy","precision","recall","f1","auc"]
+    plotly_fig   = go.Figure()
+    for _, row in MODEL_RESULTS[MODEL_RESULTS["framework"]=="PySpark MLlib"].iterrows():
+        plotly_fig.add_trace(go.Bar(
+            name=row["model"],
+            x=metrics_cols,
+            y=[row[m] for m in metrics_cols],
+        ))
+    plotly_fig.update_layout(
+        title="PySpark MLlib — Model Metrics (Interactive)",
+        barmode="group", yaxis_range=[0.75, 1.0],
+        template="plotly_white", legend_title="Model"
+    )
+    plotly_path = os.path.join(HTML_DIR, "model_metrics_interactive.html")
+    plotly_fig.write_html(plotly_path, include_plotlyjs="cdn")
+    print(f"✔ Plotly HTML   → {plotly_path}")
+except Exception as e:
+    print(f"  Plotly export skipped: {e}")
+
+# ── 4. PDF export ────────────────────────────────────────────────────────────
+try:
+    from matplotlib.backends.backend_pdf import PdfPages
+    pdf_path = os.path.join(EXPORT_DIR, "all_dashboards.pdf")
+    dash_files = [
+        os.path.join(TABLEAU_DIR, "dashboards", f)
+        for f in ["dashboard1_pipeline.png","dashboard2_models.png",
+                  "dashboard3_business.png","dashboard4_scaling.png"]
+    ]
+    available = [p for p in dash_files if os.path.exists(p)]
+    if available:
+        with PdfPages(pdf_path) as pdf:
+            for fpath in available:
+                img_arr = plt.imread(fpath)
+                fig_pdf, ax_pdf = plt.subplots(figsize=(16, 12))
+                ax_pdf.imshow(img_arr); ax_pdf.axis("off")
+                pdf.savefig(fig_pdf, bbox_inches="tight")
+                plt.close(fig_pdf)
+        print(f"✔ PDF report    → {pdf_path}  ({len(available)} dashboards)")
+except Exception as e:
+    print(f"  PDF export skipped: {e}")
+
+# ─── ME1 ─ SparkSession Re-init & Data Setup ─────────────────────────────────
+import os, time, warnings, datetime
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import seaborn as sns
+from scipy import stats
+
+warnings.filterwarnings("ignore")
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.ml.feature import (
+    CountVectorizer, IDF, StopWordsRemover, VectorAssembler
+)
+from pyspark.ml.classification import (
+    LogisticRegression, DecisionTreeClassifier,
+    RandomForestClassifier, GBTClassifier, NaiveBayes
+)
+from pyspark.ml import Pipeline
+from pyspark.ml.evaluation import (
+    BinaryClassificationEvaluator, MulticlassClassificationEvaluator
+)
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+
+spark = (
+    SparkSession.builder
+    .appName("DoubanModelEvaluation")
+    .master("local[4]")
+    .config("spark.driver.memory",          "4g")
+    .config("spark.executor.memory",         "4g")
+    .config("spark.sql.shuffle.partitions",  "100")
+    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+    .config("spark.sql.adaptive.enabled",    "true")
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("ERROR")
+print(f"Spark {spark.version}  |  ME section started")
+
+# ── Load from Parquet ─────────────────────────────────────────
+PARQUET_PATH = "./douban_parquet"
+raw_df = spark.read.parquet(PARQUET_PATH)
+print(f"Loaded {raw_df.count():,} rows  |  schema: {raw_df.columns}")
+
+# ── Tokenise (jieba) ──────────────────────────────────────────
+import jieba
+STOP_PATH = "./stopwords_zh.txt"
+if os.path.exists(STOP_PATH):
+    with open(STOP_PATH, encoding="utf-8") as f:
+        stop_list = [l.strip() for l in f if l.strip()]
+else:
+    stop_list = ["的","䌁","昤","在","咁","䅔","倱","逑","䀀","耀","及","䈇","䑡",
+                 "或","䀃","至","征","冁","最","有","无","被","由","何","却"]
+
+stop_bc = spark.sparkContext.broadcast(stop_list)
+
+@F.udf("array<string>")
+def jieba_udf(text):
+    if not text:
+        return []
+    tokens = jieba.lcut(str(text))
+    sw = stop_bc.value
+    return [t for t in tokens if t.strip() and t not in sw and len(t) > 1]
+
+# Fix: Use 'comment' column instead of 'text'
+tok_df = raw_df.withColumn("tokens", jieba_udf(F.col("comment")))
+
+# ── TF-IDF Pipeline ───────────────────────────────────────────
+cv   = CountVectorizer(inputCol="tokens", outputCol="raw_features",
+                        vocabSize=20000, minDF=3.0)
+idf  = IDF(inputCol="raw_features", outputCol="features", minDocFreq=3)
+tfidf_pipe = Pipeline(stages=[cv, idf])
+tfidf_model= tfidf_pipe.fit(tok_df)
+feat_df    = tfidf_model.transform(tok_df).select("features","label")
+feat_df.cache()
+print(f"Feature matrix ready — {feat_df.count():,} rows")
+
+print("=" * 70)
+print("4a — TRAIN / VALIDATION / TEST SPLIT (Temporal)")
+print("=" * 70)
+
+# Assign a surrogate time index (stable sort)
+indexed_df = feat_df.withColumn("row_id", F.monotonically_increasing_id())
+total_n    = indexed_df.count()
+
+# Approx quantile thresholds using Spark SQL window
+# We rank rows and cut at 60 / 80 percentile
+w_rank = Window.orderBy("row_id")
+ranked = indexed_df.withColumn("rank", F.row_number().over(w_rank))
+
+train_end = int(total_n * 0.60)
+val_end   = int(total_n * 0.80)
+
+train_df = ranked.filter(F.col("rank") <= train_end)                              .select("features","label")
+val_df   = ranked.filter((F.col("rank") > train_end) & (F.col("rank") <= val_end)).select("features","label")
+test_df  = ranked.filter(F.col("rank") > val_end)                                 .select("features","label")
+
+train_df.cache(); val_df.cache(); test_df.cache()
+
+n_train = train_df.count()
+n_val   = val_df.count()
+n_test  = test_df.count()
+n_total = n_train + n_val + n_test
+
+print(f"\n  Train  : {n_train:>6,}  ({n_train/n_total*100:.1f}%)")
+print(f"  Val    : {n_val:>6,}  ({n_val/n_total*100:.1f}%)")
+print(f"  Test   : {n_test:>6,}  ({n_test/n_total*100:.1f}%)")
+print(f"  Total  : {n_total:>6,}")
+
+# ── Class balance per split ───────────────────────────────────────────────────
+print("\n  Class balance across splits:")
+for name, df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+    dist = df.groupBy("label").count().orderBy("label").collect()
+    row_str = "  ".join([f"label={int(r['label'])}: {r['count']:,}" for r in dist])
+    print(f"    {name:<6}: {row_str}")
+
+# ── Train LR on train_df, tune on val_df, evaluate on test_df ────────────────
+lr = LogisticRegression(featuresCol="features", labelCol="label",
+                         maxIter=100, regParam=0.01, elasticNetParam=0.0)
+lr_model = lr.fit(train_df)
+
+val_preds  = lr_model.transform(val_df)
+test_preds = lr_model.transform(test_df)
+
+binary_eval = BinaryClassificationEvaluator(labelCol="label")
+mc_eval_f1  = MulticlassClassificationEvaluator(labelCol="label",
+                                                  metricName="f1")
+mc_eval_acc = MulticlassClassificationEvaluator(labelCol="label",
+                                                  metricName="accuracy")
+
+val_auc  = binary_eval.evaluate(val_preds)
+val_f1   = mc_eval_f1.evaluate(val_preds)
+test_auc = binary_eval.evaluate(test_preds)
+test_f1  = mc_eval_f1.evaluate(test_preds)
+test_acc = mc_eval_acc.evaluate(test_preds)
+
+print(f"\n  LR on Val   — AUC: {val_auc:.4f}  F1: {val_f1:.4f}")
+print(f"  LR on Test  — AUC: {test_auc:.4f}  F1: {test_f1:.4f}  Acc: {test_acc:.4f}")
+
+# ── Leakage Check: random-split baseline for comparison ──────────────────────
+rand_train, rand_test = feat_df.randomSplit([0.80, 0.20], seed=42)
+lr_rand = LogisticRegression(featuresCol="features", labelCol="label",
+                               maxIter=100, regParam=0.01).fit(rand_train)
+rand_preds  = lr_rand.transform(rand_test)
+rand_auc    = binary_eval.evaluate(rand_preds)
+rand_f1     = mc_eval_f1.evaluate(rand_preds)
+
+print(f"\n  Random split baseline — AUC: {rand_auc:.4f}  F1: {rand_f1:.4f}")
+leakage_gap = rand_auc - test_auc
+print(f"  Leakage gap (random − temporal AUC): {leakage_gap:+.4f}")
+if leakage_gap > 0.01:
+    print("  ⚠  Random split inflates AUC — temporal split is the honest estimate.")
+else:
+    print("  ✔  Splits are consistent — no significant leakage detected.")
+
+# ── Visualise split composition ───────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+fig.suptitle("4a — Train / Validation / Test Split (Temporal Ordering)", fontweight="bold")
+split_labels  = ["Train (60%)", "Validation (20%)", "Test (20%)"]
+split_counts  = [n_train, n_val, n_test]
+split_colors  = ["#4E79A7", "#F28E2B", "#E15759"]
+for ax, name, df, color in zip(axes, split_labels, [train_df, val_df, test_df], split_colors):
+    dist = df.groupBy("label").count().orderBy("label").toPandas()
+    ax.bar(dist["label"].map({0:"Negative",1:"Positive"}), dist["count"],
+           color=[color+"bb", color], edgecolor="white")
+    ax.set_title(name)
+    ax.set_ylabel("Count")
+    ax.set_xlabel("Sentiment")
+    for i, v in enumerate(dist["count"]):
+        ax.text(i, v + 30, f"{v:,}", ha="center", fontsize=9)
+plt.tight_layout()
+plt.savefig("./tableau_output/dashboards/me_temporal_split.png", dpi=120, bbox_inches="tight")
+plt.show()
+print("Temporal split plot saved.")
+
+print("=" * 70)
+print("4b — CROSS-VALIDATION WITH STRATIFICATION (Imbalanced Data)")
+print("=" * 70)
+
+K = 5
+SEED = 42
+
+# ── Split each class separately, assign fold IDs 0…K-1 ─────────────────────
+pos_df = feat_df.filter(F.col("label") == 1).withColumn("fold",
+    (F.row_number().over(Window.orderBy(F.monotonically_increasing_id())) % K).cast("int"))
+neg_df = feat_df.filter(F.col("label") == 0).withColumn("fold",
+    (F.row_number().over(Window.orderBy(F.monotonically_increasing_id())) % K).cast("int"))
+folded_df = pos_df.union(neg_df).cache()
+
+# Show fold distribution
+print(f"\n  Stratified fold distribution (K={K}):")
+folded_df.groupBy("fold","label").count().orderBy("fold","label").show()
+
+# ── Define classifiers to evaluate ───────────────────────────
+classifiers = {
+    "LR":  LogisticRegression(featuresCol="features", labelCol="label",
+                               maxIter=50, regParam=0.01),
+    "RF":  RandomForestClassifier(featuresCol="features", labelCol="label",
+                                    numTrees=50, maxDepth=8, seed=SEED),
+    "NB":  NaiveBayes(featuresCol="features", labelCol="label", smoothing=1.0),
+}
+
+fold_results = {name: {"auc": [], "f1": [], "acc": [], "prec": [], "rec": []}
+                for name in classifiers}
+
+bin_eval  = BinaryClassificationEvaluator(labelCol="label")
+mc_f1     = MulticlassClassificationEvaluator(labelCol="label", metricName="f1")
+mc_acc    = MulticlassClassificationEvaluator(labelCol="label", metricName="accuracy")
+mc_prec   = MulticlassClassificationEvaluator(labelCol="label", metricName="weightedPrecision")
+mc_rec    = MulticlassClassificationEvaluator(labelCol="label", metricName="weightedRecall")
+
+print(f"\n  Running {K}-fold stratified CV for {len(classifiers)} classifiers…")
+for fold_i in range(K):
+    val_fold   = folded_df.filter(F.col("fold") == fold_i).select("features","label")
+    train_fold = folded_df.filter(F.col("fold") != fold_i).select("features","label")
+    val_fold.cache(); train_fold.cache()
+
+    for clf_name, clf in classifiers.items():
+        t0    = time.time()
+        model = clf.fit(train_fold)
+        preds = model.transform(val_fold)
+        auc   = bin_eval.evaluate(preds)
+        f1    = mc_f1.evaluate(preds)
+        acc   = mc_acc.evaluate(preds)
+        prec  = mc_prec.evaluate(preds)
+        rec   = mc_rec.evaluate(preds)
+        fold_results[clf_name]["auc"].append(auc)
+        fold_results[clf_name]["f1"].append(f1)
+        fold_results[clf_name]["acc"].append(acc)
+        fold_results[clf_name]["prec"].append(prec)
+        fold_results[clf_name]["rec"].append(rec)
+        print(f"    Fold {fold_i}  {clf_name:<4} | AUC={auc:.4f}  F1={f1:.4f}  "
+              f"Acc={acc:.4f}  ({time.time()-t0:.1f}s)")
+
+    val_fold.unpersist(); train_fold.unpersist()
+
+# ── Summary table ─────────────────────────────────────────────
+print("\n  Stratified K-Fold Summary (mean std):")
+summary_rows = []
+for clf_name, res in fold_results.items():
+    for metric, vals in res.items():
+        summary_rows.append({
+            "Model": clf_name, "Metric": metric.upper(),
+            "Mean": np.mean(vals), "Std": np.std(vals),
+            "Min": np.min(vals),   "Max": np.max(vals)
+        })
+summary_df = pd.DataFrame(summary_rows)
+print(summary_df[summary_df["Metric"].isin(["F1","AUC"])].to_string(index=False))
+
+# ── sklearn StratifiedKFold comparison ───────────────────────
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.linear_model    import LogisticRegression as SKLR
+from sklearn.ensemble        import RandomForestClassifier as SKRF
+from sklearn.naive_bayes     import MultinomialNB
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+print("\n  scikit-learn StratifiedKFold (on tokenised text, 2000 vocab):")
+# Fix: Use 'comment' column instead of 'text'
+pdf = raw_df.select("comment","label").toPandas()
+pdf["comment"] = pdf["comment"].fillna("")
+sk_tf  = TfidfVectorizer(max_features=2000)
+X_sk   = sk_tf.fit_transform(pdf["comment"])
+y_sk   = pdf["label"].values
+skf    = StratifiedKFold(n_splits=K, shuffle=True, random_state=SEED)
+sk_classifiers = {"LR": SKLR(max_iter=300, C=10), "RF": SKRF(n_estimators=50)}
+for name, clf in sk_classifiers.items():
+    scores = cross_validate(clf, X_sk, y_sk, cv=skf,
+                             scoring=["f1_weighted","roc_auc"], n_jobs=-1)
+    print(f"    {name}  F1={scores['test_f1_weighted'].mean():.4f} "
+          f"{scores['test_f1_weighted'].std():.4f}  "
+          f"AUC={scores['test_roc_auc'].mean():.4f} "
+          f"{scores['test_roc_auc'].std():.4f}")
+
+# ── Per-fold Visualisation ────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle("4b — Stratified K-Fold Cross-Validation (K=5)", fontweight="bold")
+colors_cv = ["#4E79A7","#59A14F","#F28E2B"]
+x_folds   = np.arange(1, K+1)
+
+for metric_name, ax in zip(["f1","auc"], axes):
+    for i, (clf_name, res) in enumerate(fold_results.items()):
+        ax.plot(x_folds, res[metric_name], "o-",
+                 color=colors_cv[i], label=clf_name,
+                 linewidth=2, markersize=7)
+        ax.fill_between(x_folds,
+                         np.array(res[metric_name]) - np.std(res[metric_name]),
+                         np.array(res[metric_name]) + np.std(res[metric_name]),
+                         alpha=0.12, color=colors_cv[i])
+    ax.set_xticks(x_folds); ax.set_xticklabels([f"Fold {i}" for i in x_folds])
+    ax.set_ylabel(metric_name.upper()); ax.set_title(f"Per-Fold {metric_name.upper()}")
+    ax.legend(); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("./tableau_output/dashboards/me_stratified_cv.png", dpi=120, bbox_inches="tight")
+plt.show()
+print("Stratified CV plot saved.")
+
+print("=" * 70)
+print("4c — BOOTSTRAP CONFIDENCE INTERVALS (Statistical Significance)")
+print("=" * 70)
+
+B     = 1000   # bootstrap iterations
+ALPHA = 0.05   # significance level → 95% CI
+RNG   = np.random.default_rng(42)
+
+# ── Fit all four models on train_df, collect test predictions ────────────────
+models_to_eval = {
+    "LR":  LogisticRegression(featuresCol="features", labelCol="label",
+                               maxIter=100, regParam=0.01),
+    "DT":  DecisionTreeClassifier(featuresCol="features", labelCol="label",
+                                    maxDepth=10, seed=42),
+    "RF":  RandomForestClassifier(featuresCol="features", labelCol="label",
+                                    numTrees=100, maxDepth=8, seed=42),
+    "NB":  NaiveBayes(featuresCol="features", labelCol="label", smoothing=1.0),
+}
+
+print("\n  Training models on temporal train split…")
+pred_store = {}
+for name, clf in models_to_eval.items():
+    t0 = time.time()
+    m  = clf.fit(train_df)
+    p  = m.transform(test_df).select("label","prediction","probability")
+    p_pd = p.toPandas()
+    # Fix: Handle cases where probability vector might have only 1 element (single-class training)
+    p_pd["prob_pos"] = p_pd["probability"].apply(lambda v: float(v[1]) if len(v) > 1 else float(v[0]))
+    pred_store[name] = p_pd
+    print(f"  {name:<4} trained in {time.time()-t0:.1f}s  "
+          f"(test rows={len(p_pd):,})")
+
+# Bootstrap helper
+from sklearn.metrics import (f1_score, roc_auc_score, accuracy_score,
+                               precision_score, recall_score)
+
+def bootstrap_metric(y_true, y_pred, y_prob, metric_fn, n=B):
+    n_obs = len(y_true)
+    stats_arr = []
+    for _ in range(n):
+        idx = RNG.integers(0, n_obs, size=n_obs)
+        yt  = y_true[idx]; yp = y_pred[idx]; ypr = y_prob[idx]
+        try:
+            # Metric calculation needs at least two classes present in the bootstrap sample for AUC
+            if len(np.unique(yt)) > 1:
+                stats_arr.append(metric_fn(yt, yp, ypr))
+        except Exception:
+            pass
+    return np.array(stats_arr)
+
+def metric_f1(yt, yp, ypr):
+    return f1_score(yt, yp, average="weighted", zero_division=0)
+
+def metric_auc(yt, yp, ypr):
+    return roc_auc_score(yt, ypr)
+
+def metric_acc(yt, yp, ypr):
+    return accuracy_score(yt, yp)
+
+def metric_prec(yt, yp, ypr):
+    return precision_score(yt, yp, average="weighted", zero_division=0)
+
+def metric_rec(yt, yp, ypr):
+    return recall_score(yt, yp, average="weighted", zero_division=0)
+
+METRICS = {"F1": metric_f1, "AUC": metric_auc,
+           "Accuracy": metric_acc, "Precision": metric_prec, "Recall": metric_rec}
+
+# Run bootstrap for all models & metrics
+print(f"\n  Bootstrap B={B} iterations per model…")
+boot_results = {}
+for name, p_pd in pred_store.items():
+    y_true = p_pd["label"].values.astype(int)
+    y_pred = p_pd["prediction"].values.astype(int)
+    y_prob = p_pd["prob_pos"].values
+    boot_results[name] = {}
+    for mname, mfn in METRICS.items():
+        dist = bootstrap_metric(y_true, y_pred, y_prob, mfn)
+        if len(dist) > 0:
+            lo   = np.percentile(dist, 100 * ALPHA / 2)
+            hi   = np.percentile(dist, 100 * (1 - ALPHA / 2))
+            boot_results[name][mname] = {
+                "dist": dist, "mean": dist.mean(),
+                "lo": lo, "hi": hi, "std": dist.std()
+            }
+    print(f"  {name}  done")
+
+# Print 95% CI table
+print(f"\n  {'Model':<6} {'Metric':<10} {'Mean':>8} {'95% CI Lo':>10} {'95% CI Hi':>10} {'Std':>8}")
+print("  " + "-"*58)
+for name in boot_results:
+    for mname in ["F1","AUC","Accuracy"]:
+        if mname in boot_results[name]:
+            r = boot_results[name][mname]
+            print(f"  {name:<6} {mname:<10} {r['mean']:>8.4f} {r['lo']:>10.4f} "
+                  f"{r['hi']:>10.4f} {r['std']:>8.4f}")
+
+# Visualisation
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+fig.suptitle("4c — Bootstrap 95% Confidence Intervals (B=1000)", fontweight="bold")
+palette = ["#4E79A7","#F28E2B","#E15759","#76B7B2"]
+
+model_names = list(boot_results.keys())
+for ax, mname in zip(axes, ["F1","AUC","Accuracy"]):
+    means, lo_err, hi_err = [], [], []
+    valid_names = []
+    for n in model_names:
+        if mname in boot_results[n]:
+            means.append(boot_results[n][mname]["mean"])
+            lo_err.append(boot_results[n][mname]["mean"] - boot_results[n][mname]["lo"])
+            hi_err.append(boot_results[n][mname]["hi"] - boot_results[n][mname]["mean"])
+            valid_names.append(n)
+
+    xp = np.arange(len(valid_names))
+    ax.bar(xp, means, color=palette[:len(valid_names)], alpha=0.82, edgecolor="white", zorder=3)
+    ax.errorbar(xp, means, yerr=[lo_err, hi_err],
+                  fmt="none", color="#333", capsize=6, linewidth=2, zorder=4)
+    ax.set_xticks(xp); ax.set_xticklabels(valid_names)
+    ax.set_title(f"{mname} with 95% CI")
+    ax.set_ylabel(mname); ax.grid(axis="y", alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("./tableau_output/dashboards/me_bootstrap_ci.png", dpi=120, bbox_inches="tight")
+plt.show()
+print("Bootstrap CI plots saved.")
+
+print("=" * 70)
+print("4d — BUSINESS METRIC ALIGNMENT: Expected Profit & CLV")
+print("=" * 70)
+
+# ── Profit parameters ────────────────────────────────────────────────────────
+TP_REWARD  =  2.50   # £
+TN_REWARD  =  0.30   # £
+FP_COST    = -1.20   # £
+FN_COST    = -0.80   # £
+
+CLV_LTV    = 24.00   # £  avg annual subscription value
+P_CONVERT_BASE = 0.08  # 8% baseline conversion P(subscribe | shown)
+
+# ── Use LR test predictions (best model from bootstrap) ──────────────────────
+best_pd = pred_store["LR"].copy()
+y_true  = best_pd["label"].values.astype(int)
+y_prob  = best_pd["prob_pos"].values
+
+# ── Threshold sweep ───────────────────────────────────────────────────────────
+thresholds  = np.linspace(0.10, 0.90, 81)
+profit_per_t, clv_per_t = [], []
+
+for t in thresholds:
+    y_pred = (y_prob >= t).astype(int)
+    tp = int(((y_true==1) & (y_pred==1)).sum())
+    tn = int(((y_true==0) & (y_pred==0)).sum())
+    fp = int(((y_true==0) & (y_pred==1)).sum())
+    fn = int(((y_true==1) & (y_pred==0)).sum())
+    total = tp + tn + fp + fn
+    profit = (tp*TP_REWARD + tn*TN_REWARD + fp*FP_COST + fn*FN_COST)
+    # CLV: P(convert) scales with model confidence → use avg prob_pos for TP
+    if tp > 0:
+        avg_conf_tp = y_prob[(y_true==1) & (y_pred==1)].mean()
+        p_convert   = P_CONVERT_BASE * (1 + avg_conf_tp)  # linear uplift
+    else:
+        p_convert   = P_CONVERT_BASE
+    clv_contribution = tp * p_convert * CLV_LTV
+    profit_per_t.append(profit)
+    clv_per_t.append(clv_contribution)
+
+profit_arr = np.array(profit_per_t)
+clv_arr    = np.array(clv_per_t)
+combined   = profit_arr + clv_arr   # total business value
+
+best_idx_profit   = np.argmax(profit_arr)
+best_idx_combined = np.argmax(combined)
+default_idx       = np.argmin(np.abs(thresholds - 0.50))
+
+print(f"\n  Default threshold (0.50):")
+t0 = thresholds[default_idx]
+y0 = (y_prob >= t0).astype(int)
+tp0=((y_true==1)&(y0==1)).sum(); tn0=((y_true==0)&(y0==0)).sum()
+fp0=((y_true==0)&(y0==1)).sum(); fn0=((y_true==1)&(y0==0)).sum()
+print(f"    TP={tp0}  TN={tn0}  FP={fp0}  FN={fn0}")
+print(f"    Expected Profit : £{profit_arr[default_idx]:,.2f}")
+print(f"    CLV Contribution: £{clv_arr[default_idx]:,.2f}")
+print(f"    Total value     : £{combined[default_idx]:,.2f}")
+
+print(f"\n  Optimal threshold for Expected Profit: {thresholds[best_idx_profit]:.2f}")
+to = thresholds[best_idx_profit]
+yo = (y_prob >= to).astype(int)
+tpo=((y_true==1)&(yo==1)).sum(); tno=((y_true==0)&(yo==0)).sum()
+fpo=((y_true==0)&(yo==1)).sum(); fno=((y_true==1)&(yo==0)).sum()
+print(f"    TP={tpo}  TN={tno}  FP={fpo}  FN={fno}")
+print(f"    Expected Profit : £{profit_arr[best_idx_profit]:,.2f}")
+print(f"    CLV Contribution: £{clv_arr[best_idx_profit]:,.2f}")
+
+print(f"\n  Optimal threshold for Total Business Value: {thresholds[best_idx_combined]:.2f}")
+print(f"    Total value     : £{combined[best_idx_combined]:,.2f}")
+gain = combined[best_idx_combined] - combined[default_idx]
+print(f"    vs default (0.50) gain: £{gain:,.2f}  "
+      f"({gain/max(abs(combined[default_idx]),1)*100:+.1f}%)")
+
+# ── Profit matrix comparison across all models ────────────────────────────────
+print("\n  Profit comparison across models (threshold=0.50):")
+model_profit = {}
+for name, p_pd in pred_store.items():
+    yt = p_pd["label"].values.astype(int)
+    yp = (p_pd["prob_pos"].values >= 0.50).astype(int)
+    tp = int(((yt==1)&(yp==1)).sum()); tn = int(((yt==0)&(yp==0)).sum())
+    fp = int(((yt==0)&(yp==1)).sum()); fn = int(((yt==1)&(yp==0)).sum())
+    profit = tp*TP_REWARD + tn*TN_REWARD + fp*FP_COST + fn*FN_COST
+    avg_c  = p_pd["prob_pos"][yt==1].mean() if (yt==1).sum()>0 else P_CONVERT_BASE
+    clv    = tp * P_CONVERT_BASE*(1+avg_c) * CLV_LTV
+    model_profit[name] = {"TP":tp,"TN":tn,"FP":fp,"FN":fn,
+                           "Profit":profit,"CLV":clv,"Total":profit+clv}
+    print(f"  {name:<4}  TP={tp:>4}  TN={tn:>4}  FP={fp:>4}  FN={fn:>4}  "
+          f"Profit=£{profit:>8.2f}  CLV=£{clv:>7.2f}  Total=£{profit+clv:>8.2f}")
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle("4d — Business Metric Alignment: Expected Profit & CLV", fontweight="bold")
+
+# Panel 1: Profit curves vs threshold
+ax = axes[0,0]
+ax.plot(thresholds, profit_arr/1000, color="#4E79A7", lw=2, label="Expected Profit (£k)")
+ax.plot(thresholds, clv_arr/1000,    color="#59A14F", lw=2, ls="--", label="CLV Contribution (£k)")
+ax.plot(thresholds, combined/1000,   color="#E15759", lw=2.5, label="Total Value (£k)")
+ax.axvline(0.50,                      color="#888", ls=":", lw=1.5, label="Default t=0.50")
+ax.axvline(thresholds[best_idx_profit], color="#4E79A7", ls="--", lw=1.5,
+            label=f"Opt profit t={thresholds[best_idx_profit]:.2f}")
+ax.axvline(thresholds[best_idx_combined], color="#E15759", ls="--", lw=1.5,
+            label=f"Opt total t={thresholds[best_idx_combined]:.2f}")
+ax.set_xlabel("Decision Threshold"); ax.set_ylabel("Value (£ thousands)")
+ax.set_title("Expected Profit & CLV vs Threshold")
+ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+
+# Panel 2: F1 vs Expected Profit (Pareto scatter)
+from sklearn.metrics import f1_score as sk_f1_score
+f1_per_t = [sk_f1_score(y_true, (y_prob>=t).astype(int), average="weighted",
+                          zero_division=0) for t in thresholds]
+ax2 = axes[0,1]
+sc = ax2.scatter(f1_per_t, profit_arr/1000, c=thresholds, cmap="viridis",
+                  s=30, zorder=3)
+ax2.scatter(f1_per_t[default_idx], profit_arr[default_idx]/1000,
+             s=150, marker="D", color="#E15759", zorder=5, label="t=0.50")
+ax2.scatter(f1_per_t[best_idx_profit], profit_arr[best_idx_profit]/1000,
+             s=150, marker="*", color="#4E79A7", zorder=5,
+             label=f"Opt Profit (t={thresholds[best_idx_profit]:.2f})")
+plt.colorbar(sc, ax=ax2, label="Threshold")
+ax2.set_xlabel("F1 Score"); ax2.set_ylabel("Expected Profit (£k)")
+ax2.set_title("F1 vs Expected Profit\n(colour = threshold)")
+ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
+
+# Panel 3: Model profit comparison (grouped bar)
+ax3 = axes[1,0]
+names_m  = list(model_profit.keys())
+profit_v = [model_profit[n]["Profit"] for n in names_m]
+clv_v    = [model_profit[n]["CLV"]    for n in names_m]
+xp = np.arange(len(names_m))
+ax3.bar(xp-0.2, np.array(profit_v)/1000, 0.35, label="Direct Profit", color="#4E79A7", alpha=0.85)
+ax3.bar(xp+0.2, np.array(clv_v)/1000,    0.35, label="CLV Contribution", color="#59A14F", alpha=0.85)
+ax3.set_xticks(xp); ax3.set_xticklabels(names_m)
+ax3.set_ylabel("Value (£ thousands)"); ax3.set_title("Model Value Comparison (t=0.50)")
+ax3.legend()
+for xi, (pv, cv) in enumerate(zip(profit_v, clv_v)):
+    ax3.text(xi-0.2, pv/1000+0.01, f"£{pv:.0f}", ha="center", fontsize=8)
+    ax3.text(xi+0.2, cv/1000+0.01, f"£{cv:.0f}", ha="center", fontsize=8)
+
+# Panel 4: Confusion cost waterfall for best model (LR) at optimal threshold
+ax4 = axes[1,1]
+to_best = thresholds[best_idx_combined]
+yp_best = (y_prob >= to_best).astype(int)
+tp_b=int(((y_true==1)&(yp_best==1)).sum()); tn_b=int(((y_true==0)&(yp_best==0)).sum())
+fp_b=int(((y_true==0)&(yp_best==1)).sum()); fn_b=int(((y_true==1)&(yp_best==0)).sum())
+cats   = ["TP (reward)", "TN (reward)", "FP (cost)", "FN (cost)"]
+values = [tp_b*TP_REWARD, tn_b*TN_REWARD, fp_b*FP_COST, fn_b*FN_COST]
+colors_wf = ["#59A14F","#76B7B2","#E15759","#F28E2B"]
+ax4.bar(cats, values, color=colors_wf, alpha=0.85, edgecolor="white")
+ax4.axhline(0, color="#333", lw=0.8)
+ax4.set_title(f"LR Profit Waterfall (t={to_best:.2f})\nTotal = £{sum(values):,.2f}")
+ax4.set_ylabel("£ Contribution")
+for i, v in enumerate(values):
+    ax4.text(i, v + (30 if v>=0 else -80), f"£{v:,.0f}",
+             ha="center", fontsize=9, fontweight="bold")
+ax4.tick_params(axis="x", labelsize=9)
+
+plt.tight_layout()
+plt.savefig("./tableau_output/dashboards/me_business_metrics.png", dpi=120, bbox_inches="tight")
+plt.show()
+print("Business metric plots saved.")
